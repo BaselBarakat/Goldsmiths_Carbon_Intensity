@@ -1,10 +1,10 @@
-# Sunderland Carbon Intensity Dashboard
+# Goldsmiths Carbon Intensity Dashboard
 
-This Streamlit app provides real-time and historical data on carbon intensity in Sunderland, UK. The data is sourced from the UK Carbon Intensity API and displayed interactively, offering insights into the environmental impact of energy use in the region.
+This Streamlit app provides real-time and historical data on carbon intensity in Goldsmiths, UK. The data is sourced from the UK Carbon Intensity API and displayed interactively, offering insights into the environmental impact of energy use in the region.
 
 ## Features
 
-- **Real-Time Monitoring**: Get current carbon intensity data for Sunderland.
+- **Real-Time Monitoring**: Get current carbon intensity data for Goldsmiths.
 - **Historical Data Analysis**: Visualize past trends using interactive tools.
 - **Interactive Date Range Selection**: Filter data based on a custom date range.
 - **Detailed Carbon Intensity Statistics**: Analyze key statistics and visualizations.
