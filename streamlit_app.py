@@ -568,23 +568,28 @@ def render_generation_tab(history_df: pd.DataFrame, days: int) -> None:
 def render_data_explorer_tab(history_df: pd.DataFrame) -> None:
     st.subheader("📅 Filter history")
 
-    min_ts = history_df["from"].min().to_pydatetime()
-    max_ts = history_df["from"].max().to_pydatetime()
+    # Strip tz for the UI control. Streamlit's slider doesn't need timezone
+    # info, and pandas 3.0 rejects `pd.Timestamp(tz_aware_dt, tz="UTC")`.
+    from_series = history_df["from"].dt.tz_convert("UTC").dt.tz_localize(None)
+    min_ts = from_series.min().to_pydatetime()
+    max_ts = from_series.max().to_pydatetime()
 
     if min_ts == max_ts:
         st.info("Not enough data yet to show a range slider.")
         return
 
+    default_start = max(min_ts, max_ts - timedelta(days=7))
     start, end = st.slider(
         "Select a date range",
         min_value=min_ts, max_value=max_ts,
-        value=(max_ts - timedelta(days=7), max_ts),
+        value=(default_start, max_ts),
         format="YYYY-MM-DD HH:mm",
     )
 
-    mask = (history_df["from"] >= pd.Timestamp(start, tz="UTC")) & (
-        history_df["from"] <= pd.Timestamp(end, tz="UTC")
-    )
+    # Re-attach UTC for comparison against the tz-aware history column.
+    start_utc = pd.Timestamp(start).tz_localize("UTC")
+    end_utc = pd.Timestamp(end).tz_localize("UTC")
+    mask = (history_df["from"] >= start_utc) & (history_df["from"] <= end_utc)
     subset = history_df.loc[mask].sort_values("from", ascending=False)
 
     st.caption(f"{len(subset):,} half‑hour slots in the selection.")
