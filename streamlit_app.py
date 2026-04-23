@@ -86,20 +86,43 @@ st.set_page_config(
 # Data layer
 # ===========================================================================
 
+def ensure_utc(df: pd.DataFrame, cols: tuple[str, ...] = ("from", "to")) -> pd.DataFrame:
+    """Force the given columns to tz-aware UTC datetime dtype.
+
+    Idempotent and tolerant of mixed/stringified timestamps left behind by
+    older CSV writes. Rows whose timestamps cannot be parsed are dropped
+    rather than poisoning the whole column's dtype.
+    """
+    if df.empty:
+        # Even an empty frame must carry the right dtypes for downstream
+        # .dt accessors to be valid.
+        for col in cols:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
+        return df
+
+    for col in cols:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
+    # Drop rows where the primary timestamp failed to parse.
+    if "from" in df.columns:
+        df = df.dropna(subset=["from"]).copy()
+    return df
+
+
 @st.cache_data(show_spinner=False)
 def load_local_csv(path: Path) -> pd.DataFrame:
     """Load the on-disk history, returning an empty frame with the expected
     schema if nothing is cached yet."""
     columns = ["from", "to", "forecast", "index"]
     if not path.exists():
-        return pd.DataFrame(columns=columns)
+        return ensure_utc(pd.DataFrame(columns=columns))
 
+    # `parse_dates` is a best-effort hint; `ensure_utc` is the source of truth
+    # and will recover from mixed or malformed timestamp strings.
     df = pd.read_csv(path, parse_dates=["from", "to"])
-    # Drop any accidental pandas index columns that may have been persisted.
     df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
-    df["from"] = pd.to_datetime(df["from"], utc=True)
-    df["to"] = pd.to_datetime(df["to"], utc=True)
-    return df
+    return ensure_utc(df)
 
 
 def _flatten_records(raw: list[dict]) -> pd.DataFrame:
@@ -155,7 +178,7 @@ def get_forward_forecast(postcode: str) -> pd.DataFrame:
         f"{API_BASE}/regional/intensity/"
         f"{now.strftime('%Y-%m-%dT%H:%MZ')}/fw48h/postcode/{postcode}"
     )
-    return _flatten_records(_get_json(url))
+    return ensure_utc(_flatten_records(_get_json(url)))
 
 
 def refresh_local_data(postcode: str) -> pd.DataFrame:
@@ -170,7 +193,7 @@ def refresh_local_data(postcode: str) -> pd.DataFrame:
     end = datetime.now(pytz.UTC).replace(second=0, microsecond=0)
 
     if start >= end:
-        return df.sort_values("from").reset_index(drop=True)
+        return ensure_utc(df).sort_values("from").reset_index(drop=True)
 
     # Fetch day-by-day so a single failure doesn't discard everything.
     all_new: list[dict] = []
@@ -185,7 +208,7 @@ def refresh_local_data(postcode: str) -> pd.DataFrame:
 
     new_df = _flatten_records(all_new)
     if new_df.empty:
-        return df.sort_values("from").reset_index(drop=True)
+        return ensure_utc(df).sort_values("from").reset_index(drop=True)
 
     combined = (
         pd.concat([df, new_df], ignore_index=True)
@@ -193,6 +216,7 @@ def refresh_local_data(postcode: str) -> pd.DataFrame:
         .sort_values("from")
         .reset_index(drop=True)
     )
+    combined = ensure_utc(combined)
 
     # Persist for future sessions and invalidate the loader cache.
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -217,13 +241,14 @@ def best_slots(df: pd.DataFrame, n: int = 6) -> pd.DataFrame:
     """Return the N lowest-intensity rows, sorted chronologically."""
     if df.empty:
         return df
-    out = df.copy()
+    out = ensure_utc(df.copy())
     out["local_time"] = out["from"].dt.tz_convert(UK_TZ)
     return out.nsmallest(n, "forecast").sort_values("from")
 
 
 def hour_day_heatmap(df: pd.DataFrame) -> pd.DataFrame:
     """Long-format average intensity per (date, hour-of-day) in local time."""
+    df = ensure_utc(df)
     local = df["from"].dt.tz_convert(UK_TZ)
     out = pd.DataFrame({
         "date": local.dt.date,
@@ -245,7 +270,7 @@ def fuel_columns(df: pd.DataFrame) -> list[str]:
 
 def intensity_line_chart(df: pd.DataFrame, title: str) -> go.Figure:
     """Interactive intensity time-series, coloured by band."""
-    d = df.copy()
+    d = ensure_utc(df.copy())
     d["local_time"] = d["from"].dt.tz_convert(UK_TZ)
     d["category"] = d["forecast"].apply(categorize_intensity)
 
@@ -316,7 +341,7 @@ def heatmap_chart(df: pd.DataFrame) -> go.Figure:
 
 def daily_boxplot(df: pd.DataFrame) -> go.Figure:
     """Day-level distribution of intensity across the history window."""
-    d = df.copy()
+    d = ensure_utc(df.copy())
     d["day"] = d["from"].dt.tz_convert(UK_TZ).dt.date.astype(str)
     fig = px.box(
         d, x="day", y="forecast",
@@ -337,7 +362,7 @@ def generation_mix_chart(df: pd.DataFrame) -> Optional[go.Figure]:
     fuels = fuel_columns(df)
     if not fuels:
         return None
-    d = df.copy()
+    d = ensure_utc(df.copy())
     d["local_time"] = d["from"].dt.tz_convert(UK_TZ)
     long = d.melt(
         id_vars=["local_time"], value_vars=fuels,
@@ -605,6 +630,7 @@ def main() -> None:
     # Pull data (incrementally) and the live forward forecast.
     with st.spinner("Updating local dataset…"):
         history_df = refresh_local_data(settings["postcode"])
+    history_df = ensure_utc(history_df)
 
     if history_df.empty:
         st.error(
