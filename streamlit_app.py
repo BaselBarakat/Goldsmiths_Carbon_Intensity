@@ -1,301 +1,640 @@
-import streamlit as st
-import pandas as pd
-from pathlib import Path
-import pytz
+"""
+Carbon Intensity Dashboard
+==========================
+
+A Streamlit dashboard for monitoring UK regional carbon intensity, backed by
+the National Grid ESO Carbon Intensity API (https://carbonintensity.org.uk/).
+
+Features
+--------
+* Live current intensity with visual status + user‑settable threshold alerts.
+* 48‑hour forward forecast and automatic "greenest upcoming slots" picker.
+* Historical trends: interactive line chart, hour×day heatmap, daily box‑plot.
+* Generation‑mix breakdown (renewables vs fossil) as a stacked area chart.
+* Configurable region (any UK postcode area) and history window.
+* Incremental local caching to a CSV so the API is only hit for missing slots.
+
+Run with:
+    streamlit run carbon_dashboard.py
+"""
+from __future__ import annotations
+
+import logging
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional
+
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import pytz
 import requests
-import altair as alt
+import streamlit as st
 
-# Set the title and favicon for the browser tab
-st.set_page_config(page_title='Sunderland Carbon Intensity', page_icon=':earth_africa:')
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+UK_TZ = pytz.timezone("Europe/London")
+DATA_DIR = Path(__file__).parent / "data"
+CSV_PATH = DATA_DIR / "carbon.csv"
+API_BASE = "https://api.carbonintensity.org.uk"
+DEFAULT_POSTCODE = "ME4"
+DEFAULT_HISTORY_DAYS = 14
+# Earliest date to back-fill from if the CSV is empty. Kept recent to avoid
+# hammering the API on first run; adjust if you want a longer back-catalogue.
+DEFAULT_FETCH_START = datetime.now(pytz.UTC) - timedelta(days=30)
 
-# Function to load and process Carbon Intensity data
-@st.cache_data
-def get_carbon_data():
-    DATA_FILENAME = Path(__file__).parent / 'data/carbon.csv'
-    if DATA_FILENAME.exists():
-        # raw_carbon_df = pd.read_csv(DATA_FILENAME, parse_dates=['from', 'to'], infer_datetime_format=True)
-        raw_carbon_df = pd.read_csv(DATA_FILENAME, parse_dates=['from', 'to'])
-        raw_carbon_df['from'] = pd.to_datetime(raw_carbon_df['from'], utc=True)
-        raw_carbon_df['to'] = pd.to_datetime(raw_carbon_df['to'], utc=True)
-    else:
-        raw_carbon_df = pd.DataFrame(columns=['from', 'to', 'forecast', 'index'])
-    
-    try: 
-        raw_carbon_df = raw_carbon_df.drop('Unnammed:0', axis=1)
-    except:
-        print(raw_carbon_df.columns)
-    return raw_carbon_df
+# Canonical intensity bands -- the single source of truth for both the
+# categorical label and the colour used across all charts/markdown.
+# (name, lower_bound, upper_bound, colour)
+INTENSITY_BANDS: list[tuple[str, float, float, str]] = [
+    ("Very Low", 0, 50, "#2ecc71"),
+    ("Low", 50, 100, "#27ae60"),
+    ("Moderate", 100, 200, "#f39c12"),
+    ("High", 200, 300, "#e67e22"),
+    ("Very High", 300, 10_000, "#c0392b"),
+]
+COLOR_MAP: dict[str, str] = {name.lower(): color for name, _, _, color in INTENSITY_BANDS}
 
-# Function to get the last available timestamp from the DataFrame
-def get_last_timestamp_from_df(df, timestamp_column):
-    if not df.empty:
-        df[timestamp_column] = pd.to_datetime(df[timestamp_column])
-        return df[timestamp_column].max()
-    else:
-        return None
-
-# Get current UK time rounded to the nearest half hour
-def get_current_uk_time_rounded():
-    uk_timezone = pytz.timezone('Europe/London')
-    current_time = datetime.now(uk_timezone)
-    
-    # Round to the nearest half-hour
-    minutes = current_time.minute
-    if minutes < 15:
-        rounded_time = current_time.replace(minute=0, second=0, microsecond=0)
-    elif 15 <= minutes < 45:
-        rounded_time = current_time.replace(minute=30, second=0, microsecond=0)
-    else:
-        rounded_time = current_time.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-
-    return rounded_time
-
-# Define intensity categories
-def categorize_intensity(forecast):
-    if forecast < 50:
-        return "Very Low"
-    elif 50 <= forecast < 100:
-        return "Low"
-    elif 100 <= forecast < 150:
-        return "Moderate"
-    elif 150 <= forecast < 200:
-        return "High"
-    else:
-        return "Very High"
-
-# Fetch data from the Carbon Intensity API
-def fetch_data(start, end):
-    headers = {'Accept': 'application/json'}
-    url = f'https://api.carbonintensity.org.uk/regional/intensity/{start.strftime("%Y-%m-%dT%H:%MZ")}/{end.strftime("%Y-%m-%dT%H:%MZ")}/postcode/me4'
-    response = requests.get(url, headers=headers)
-    return response.json()
-
-# Main function to generate date range for new data fetching
-def generate_date_range_for_fetching(df, timestamp_column):
-    last_saved_timestamp = get_last_timestamp_from_df(df, timestamp_column)
-    
-    if last_saved_timestamp is None:
-        start_date = datetime(2021, 1, 1, tzinfo=pytz.UTC)  # Default start date if no data is available
-    else:
-        start_date = last_saved_timestamp + timedelta(minutes=30)  # Start fetching from the next time slot
-
-    end_date = get_current_uk_time_rounded()
-    
-    return start_date, end_date
-
-# Append new data to the CSV file
-def append_new_data_to_csv(new_data, filename):
-    if not new_data.empty:
-        new_data.to_csv(filename, mode='a', header=False, index=False)
-        
-# Find the lowest forecast values for today based on yesterday's data
-def get_lowest_forecast_periods(df):
-    # Convert UTC times to UK local time for proper day comparison
-    df_local = df.copy()
-    df_local['local_time'] = df_local['from'].dt.tz_convert('Europe/London')
-    df_local['date'] = df_local['local_time'].dt.date
-    df_local['hour'] = df_local['local_time'].dt.hour
-    df_local['half_hour'] = df_local['local_time'].dt.minute.apply(lambda x: 0 if x < 30 else 30)
-    
-    # Get yesterday's date
-    today = datetime.now(pytz.timezone('Europe/London')).date()
-    yesterday = today - timedelta(days=1)
-    
-    # Filter for yesterday's data
-    yesterday_data = df_local[df_local['date'] == yesterday]
-    
-    if yesterday_data.empty:
-        return pd.DataFrame()  # No data for yesterday
-    
-    # Sort by forecast value to find the lowest periods
-    sorted_periods = yesterday_data.sort_values('forecast')
-    
-    # Get the top 5 lowest forecast periods
-    lowest_periods = sorted_periods.head(5)
-    
-    return lowest_periods
-
-# Load the Carbon Intensity data
-carbon_df = get_carbon_data()
-
-# Determine the date range for fetching new data
-start_date, end_date = generate_date_range_for_fetching(carbon_df, 'to')
-
-# Fetch new data only if there's a gap between the last available timestamp and the current time
-if start_date < end_date:
-    all_records = []
-    current_start = start_date
-    while current_start < end_date:
-        current_end = min(current_start + timedelta(days=1), end_date)  # Fetch data day by day
-        data = fetch_data(current_start, current_end)
-        try:
-            entries = data['data']['data']
-        except:
-            current_start += timedelta(days=1)
-            continue
-
-        for entry in entries:
-            record = {
-                'from': entry['from'],
-                'to': entry['to'],
-                'forecast': entry['intensity']['forecast'],
-                'index': entry['intensity']['index'],
-            }
-            for mix in entry['generationmix']:
-                record[mix['fuel']] = mix['perc']
-            all_records.append(record)
-
-        current_start += timedelta(days=1)
-
-    # Convert list of records to DataFrame
-    if all_records:
-        new_data_df = pd.DataFrame(all_records)
-        new_data_df['from'] = pd.to_datetime(new_data_df['from'], utc=True)
-        new_data_df['to'] = pd.to_datetime(new_data_df['to'], utc=True)
-
-        # Append new data to the existing DataFrame and CSV
-        carbon_df = pd.concat([carbon_df, new_data_df], ignore_index=True)
-        try: 
-            carbon_df = carbon_df.drop('Unnammed:0', axis=1)
-        except:
-            print(carbon_df.columns)
-                  
-        append_new_data_to_csv(new_data_df, Path(__file__).parent / 'data/carbon.csv')
-
-# Ensure 'from' column is in UTC and sort by time
-carbon_df['from'] = pd.to_datetime(carbon_df['from'], utc=True)
-carbon_df = carbon_df.sort_values(by='from', ascending=False)
-
-try: 
-    carbon_df = carbon_df.drop('Unnammed:0', axis=1)
-except:
-    print(carbon_df.columns)
-
-# Get the latest data
-latest_data = carbon_df.iloc[0]
-latest_forecast = float(latest_data['forecast'])
-latest_index = latest_data['index']
-
-# Dashboard title and introduction
-st.title(':earth_africa: Sunderland Carbon Intensity Dashboard')
-
-# --- Latest Carbon Intensity Section ---
-st.header('🔍 Latest Carbon Intensity')
-
-# Show the forecast value with the category
-st.metric("Carbon Intensity", f"{latest_forecast} gCO₂/kWh", f"Status: {latest_index}")
-
-# Map status to colors for visual appeal
-color_map = {
-    "very low": "green",
-    "low": "lightgreen",
-    "moderate": "orange",
-    "high": "red",
-    "very high": "darkred"
+# Fuel-type colour palette, roughly grouped by renewable/fossil character.
+FUEL_COLOURS: dict[str, str] = {
+    "gas": "#d35400",
+    "coal": "#2c3e50",
+    "biomass": "#8e44ad",
+    "nuclear": "#f1c40f",
+    "hydro": "#2980b9",
+    "imports": "#7f8c8d",
+    "solar": "#f39c12",
+    "wind": "#27ae60",
+    "other": "#95a5a6",
 }
 
-# Use HTML and inline styles for colored text
-st.markdown(f'<h3>Intensity Status: <span style="color:{color_map[latest_index]};">{latest_index}</span></h3>', unsafe_allow_html=True)
+logging.basicConfig(level=logging.WARNING, format="%(levelname)s | %(message)s")
+log = logging.getLogger(__name__)
 
-# Display a progress bar to visually indicate the intensity category
-st.progress(int((latest_forecast / 400) * 100))  # Assuming 400 is the upper limit for "Very High"
-
-# --- Best Times from Yesterday Section ---
-st.header('⚡ Best Times to Use Electricity (Based on Yesterday)')
-
-# Get lowest forecast periods from yesterday
-lowest_periods = get_lowest_forecast_periods(carbon_df)
-
-if not lowest_periods.empty:
-    # Create a nice display of the best times
-    st.write("These 5 time periods had the lowest carbon intensity yesterday:")
-    
-    for _, row in lowest_periods.iterrows():
-        local_time = row['local_time']
-        period_start = local_time.strftime('%H:%M')
-        period_end = (local_time + timedelta(minutes=30)).strftime('%H:%M')
-        forecast = row['forecast']
-        intensity_category = categorize_intensity(forecast)
-        
-        # Use columns to display the time period and forecast value
-        col1, col2, col3 = st.columns([2, 2, 3])
-        with col1:
-            st.write(f"**{period_start} - {period_end}**")
-        with col2:
-            st.write(f"{forecast} gCO₂/kWh")
-        with col3:
-            st.markdown(f'<span style="color:{color_map[intensity_category.lower()]};">{intensity_category}</span>', unsafe_allow_html=True)
-    
-    st.info("💡 Consider scheduling energy-intensive activities during similar times today to reduce carbon impact.")
-else:
-    st.warning("No data available from yesterday to provide recommendations.")
-
-# --- Carbon Intensity Over Time Section ---
-st.header('📊 Carbon Intensity Over Time')
-
-# Filter data to show the latest 48 hours
-uk_timezone = pytz.timezone('Europe/London')
-current_time = datetime.now(uk_timezone)
-time_window = current_time - pd.Timedelta(hours=48)
-
-recent_df = carbon_df[carbon_df['from'] >= time_window]
-
-# Plot the line chart for recent carbon intensity
-st.line_chart(recent_df, x='from', y='forecast')
-
-# Add columns for 'day' and 'hour'
-carbon_df['day'] = carbon_df['from'].dt.date
-carbon_df['hour'] = carbon_df['from'].dt.hour
-
-# Filter the data for the last two weeks
-last_two_weeks = carbon_df[carbon_df['from'] >= (carbon_df['from'].max() - pd.Timedelta(days=14))]
-
-# Boxplot by Day using Altair (for the last 2 weeks)
-boxplot_day = alt.Chart(last_two_weeks).mark_boxplot().encode(
-    x=alt.X('day:T', title='Day'),
-    y=alt.Y('forecast:Q', title='Carbon Intensity (gCO₂/kWh)')
-).properties(
-    title='Carbon Intensity Forecast (gCO₂/kWh) by Day - Last 2 Weeks',
-    width=600
+# ---------------------------------------------------------------------------
+# Streamlit page setup
+# ---------------------------------------------------------------------------
+st.set_page_config(
+    page_title="UK Carbon Intensity Dashboard",
+    page_icon="🌍",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
-st.header('📆 Carbon Intensity Forecast (gCO₂/kWh) by Day - Last 2 Weeks')
-# Display day-based boxplot in Streamlit
-st.altair_chart(boxplot_day)
 
-# Boxplot by Hour using Altair
-boxplot_hour = alt.Chart(last_two_weeks).mark_boxplot().encode(
-    x=alt.X('hour:O', title='Hour'),
-    y=alt.Y('forecast:Q', title='Carbon Intensity (gCO₂/kWh)')
-).properties(
-    width=600
-)
-st.header('🕖 Carbon Intensity Forecast (gCO₂/kWh) by Hour - Last 2 Weeks')
+# ===========================================================================
+# Data layer
+# ===========================================================================
 
-# Display hour-based boxplot in Streamlit
-st.altair_chart(boxplot_hour)
+@st.cache_data(show_spinner=False)
+def load_local_csv(path: Path) -> pd.DataFrame:
+    """Load the on-disk history, returning an empty frame with the expected
+    schema if nothing is cached yet."""
+    columns = ["from", "to", "forecast", "index"]
+    if not path.exists():
+        return pd.DataFrame(columns=columns)
 
-# --- Data Statistics and Filtering Section ---
-st.header('📅 Select Date Range and View Data')
+    df = pd.read_csv(path, parse_dates=["from", "to"])
+    # Drop any accidental pandas index columns that may have been persisted.
+    df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
+    df["from"] = pd.to_datetime(df["from"], utc=True)
+    df["to"] = pd.to_datetime(df["to"], utc=True)
+    return df
 
-# Filter data based on selected date range
-min_date = carbon_df['from'].min()
-max_date = carbon_df['from'].max()
 
-# Streamlit slider for date range selection
-selected_dates = st.slider('Select the date range:', 
-                          min_value=min_date.to_pydatetime(), 
-                          max_value=max_date.to_pydatetime(), 
-                          value=(min_date.to_pydatetime(), max_date.to_pydatetime()))
+def _flatten_records(raw: list[dict]) -> pd.DataFrame:
+    """Convert the nested API response into a flat half-hour DataFrame."""
+    rows: list[dict] = []
+    for entry in raw:
+        row = {
+            "from": entry["from"],
+            "to": entry["to"],
+            "forecast": entry["intensity"]["forecast"],
+            "index": entry["intensity"]["index"],
+        }
+        for mix in entry.get("generationmix", []) or []:
+            row[mix["fuel"]] = mix["perc"]
+        rows.append(row)
 
-# Filter DataFrame based on selected date range
-start_date = pd.to_datetime(selected_dates[0]).tz_convert('UTC')
-end_date = pd.to_datetime(selected_dates[1]).tz_convert('UTC')
-filtered_carbon_df = carbon_df[(carbon_df['from'] >= start_date) & (carbon_df['from'] <= end_date)]
+    if not rows:
+        return pd.DataFrame()
 
-# Display filtered data
-st.write(filtered_carbon_df)
+    df = pd.DataFrame(rows)
+    df["from"] = pd.to_datetime(df["from"], utc=True)
+    df["to"] = pd.to_datetime(df["to"], utc=True)
+    return df
 
-# Display summary statistics for filtered data
-st.header('📈 Carbon Intensity Statistics')
-st.write(filtered_carbon_df.describe())
+
+def _get_json(url: str) -> list[dict]:
+    """GET the API, returning the inner `data.data` list or [] on any error."""
+    try:
+        resp = requests.get(url, headers={"Accept": "application/json"}, timeout=15)
+        resp.raise_for_status()
+        payload = resp.json()
+        return payload.get("data", {}).get("data", []) or []
+    except (requests.RequestException, ValueError) as exc:
+        log.warning("API call failed (%s): %s", url, exc)
+        return []
+
+
+def fetch_range(start: datetime, end: datetime, postcode: str) -> list[dict]:
+    """Historical intensity between two UTC timestamps for a given postcode."""
+    url = (
+        f"{API_BASE}/regional/intensity/"
+        f"{start.strftime('%Y-%m-%dT%H:%MZ')}/"
+        f"{end.strftime('%Y-%m-%dT%H:%MZ')}/postcode/{postcode}"
+    )
+    return _get_json(url)
+
+
+@st.cache_data(ttl=1800, show_spinner="Fetching 48-hour forecast…")
+def get_forward_forecast(postcode: str) -> pd.DataFrame:
+    """Return the next ~48 hours of half-hourly forecast for a postcode."""
+    now = datetime.now(pytz.UTC)
+    url = (
+        f"{API_BASE}/regional/intensity/"
+        f"{now.strftime('%Y-%m-%dT%H:%MZ')}/fw48h/postcode/{postcode}"
+    )
+    return _flatten_records(_get_json(url))
+
+
+def refresh_local_data(postcode: str) -> pd.DataFrame:
+    """Ensure the local CSV is caught up to the current half-hour slot and
+    return the combined dataset. Fetches incrementally from the last saved
+    timestamp to avoid re-downloading existing rows."""
+    df = load_local_csv(CSV_PATH).copy()
+
+    # Work out what range is missing.
+    last_ts = df["to"].max() if not df.empty else pd.NaT
+    start = (last_ts + timedelta(minutes=30)) if pd.notna(last_ts) else DEFAULT_FETCH_START
+    end = datetime.now(pytz.UTC).replace(second=0, microsecond=0)
+
+    if start >= end:
+        return df.sort_values("from").reset_index(drop=True)
+
+    # Fetch day-by-day so a single failure doesn't discard everything.
+    all_new: list[dict] = []
+    cursor = start
+    status = st.sidebar.empty()
+    while cursor < end:
+        window_end = min(cursor + timedelta(days=1), end)
+        status.caption(f"⬇️ Fetching {cursor:%Y-%m-%d}…")
+        all_new.extend(fetch_range(cursor, window_end, postcode))
+        cursor = window_end
+    status.empty()
+
+    new_df = _flatten_records(all_new)
+    if new_df.empty:
+        return df.sort_values("from").reset_index(drop=True)
+
+    combined = (
+        pd.concat([df, new_df], ignore_index=True)
+        .drop_duplicates(subset=["from"], keep="last")
+        .sort_values("from")
+        .reset_index(drop=True)
+    )
+
+    # Persist for future sessions and invalidate the loader cache.
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    combined.to_csv(CSV_PATH, index=False)
+    load_local_csv.clear()
+    return combined
+
+
+# ===========================================================================
+# Analysis helpers
+# ===========================================================================
+
+def categorize_intensity(value: float) -> str:
+    """Map a numeric forecast to its intensity band name."""
+    for name, lo, hi, _ in INTENSITY_BANDS:
+        if lo <= value < hi:
+            return name
+    return "Unknown"
+
+
+def best_slots(df: pd.DataFrame, n: int = 6) -> pd.DataFrame:
+    """Return the N lowest-intensity rows, sorted chronologically."""
+    if df.empty:
+        return df
+    out = df.copy()
+    out["local_time"] = out["from"].dt.tz_convert(UK_TZ)
+    return out.nsmallest(n, "forecast").sort_values("from")
+
+
+def hour_day_heatmap(df: pd.DataFrame) -> pd.DataFrame:
+    """Long-format average intensity per (date, hour-of-day) in local time."""
+    local = df["from"].dt.tz_convert(UK_TZ)
+    out = pd.DataFrame({
+        "date": local.dt.date,
+        "hour": local.dt.hour,
+        "forecast": df["forecast"].astype(float),
+    })
+    return out.groupby(["date", "hour"], as_index=False)["forecast"].mean()
+
+
+def fuel_columns(df: pd.DataFrame) -> list[str]:
+    """Columns representing generation-mix fuel shares."""
+    known = {"from", "to", "forecast", "index", "day", "hour", "local_time"}
+    return [c for c in df.columns if c not in known and df[c].notna().any()]
+
+
+# ===========================================================================
+# Chart builders (Plotly)
+# ===========================================================================
+
+def intensity_line_chart(df: pd.DataFrame, title: str) -> go.Figure:
+    """Interactive intensity time-series, coloured by band."""
+    d = df.copy()
+    d["local_time"] = d["from"].dt.tz_convert(UK_TZ)
+    d["category"] = d["forecast"].apply(categorize_intensity)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=d["local_time"],
+        y=d["forecast"],
+        mode="lines+markers",
+        line=dict(color="#3498db", width=2),
+        marker=dict(
+            size=6,
+            color=[COLOR_MAP[c.lower()] for c in d["category"]],
+            line=dict(width=1, color="white"),
+        ),
+        customdata=d["category"],
+        hovertemplate=(
+            "<b>%{x|%a %d %b %H:%M}</b><br>"
+            "Intensity: %{y:.0f} gCO₂/kWh<br>"
+            "Band: %{customdata}<extra></extra>"
+        ),
+        name="Forecast",
+    ))
+
+    # Overlay dotted reference lines at each band boundary.
+    for name, lo, _hi, color in INTENSITY_BANDS[1:]:
+        fig.add_hline(
+            y=lo,
+            line=dict(color=color, width=1, dash="dot"),
+            annotation_text=name,
+            annotation_position="right",
+            annotation_font_color=color,
+        )
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="Time (UK)",
+        yaxis_title="Carbon intensity (gCO₂/kWh)",
+        hovermode="x unified",
+        margin=dict(l=10, r=10, t=60, b=10),
+        height=420,
+    )
+    return fig
+
+
+def heatmap_chart(df: pd.DataFrame) -> go.Figure:
+    """Hour-of-day × date heatmap of mean intensity."""
+    data = hour_day_heatmap(df)
+    pivot = data.pivot(index="hour", columns="date", values="forecast")
+    fig = px.imshow(
+        pivot,
+        aspect="auto",
+        color_continuous_scale=[
+            (0.00, "#2ecc71"),
+            (0.25, "#27ae60"),
+            (0.50, "#f39c12"),
+            (0.75, "#e67e22"),
+            (1.00, "#c0392b"),
+        ],
+        labels=dict(x="Date", y="Hour of day", color="gCO₂/kWh"),
+    )
+    fig.update_layout(
+        title="Mean intensity by hour of day",
+        height=420,
+        margin=dict(l=10, r=10, t=60, b=10),
+    )
+    return fig
+
+
+def daily_boxplot(df: pd.DataFrame) -> go.Figure:
+    """Day-level distribution of intensity across the history window."""
+    d = df.copy()
+    d["day"] = d["from"].dt.tz_convert(UK_TZ).dt.date.astype(str)
+    fig = px.box(
+        d, x="day", y="forecast",
+        labels={"day": "Day", "forecast": "gCO₂/kWh"},
+        points=False,
+        color_discrete_sequence=["#3498db"],
+    )
+    fig.update_layout(
+        title="Daily distribution of carbon intensity",
+        height=420,
+        margin=dict(l=10, r=10, t=60, b=10),
+    )
+    return fig
+
+
+def generation_mix_chart(df: pd.DataFrame) -> Optional[go.Figure]:
+    """Stacked-area chart of the generation-mix share over time."""
+    fuels = fuel_columns(df)
+    if not fuels:
+        return None
+    d = df.copy()
+    d["local_time"] = d["from"].dt.tz_convert(UK_TZ)
+    long = d.melt(
+        id_vars=["local_time"], value_vars=fuels,
+        var_name="fuel", value_name="percent",
+    )
+    fig = px.area(
+        long, x="local_time", y="percent", color="fuel",
+        color_discrete_map=FUEL_COLOURS,
+        labels={"local_time": "Time (UK)", "percent": "Share (%)", "fuel": "Fuel"},
+    )
+    fig.update_layout(
+        title="Generation mix over time",
+        height=420,
+        hovermode="x unified",
+        margin=dict(l=10, r=10, t=60, b=10),
+    )
+    return fig
+
+
+# ===========================================================================
+# UI sections
+# ===========================================================================
+
+def sidebar_controls() -> dict:
+    """Render the sidebar and return the current user settings."""
+    st.sidebar.title("⚙️ Controls")
+    postcode = st.sidebar.text_input(
+        "Postcode area",
+        value=DEFAULT_POSTCODE,
+        help="Outward portion of a UK postcode, e.g. ME4, SR1, E1W.",
+    ).strip().upper()
+
+    history_days = st.sidebar.slider(
+        "History window (days)",
+        min_value=1, max_value=30,
+        value=DEFAULT_HISTORY_DAYS,
+        help="Range used for the heatmap, box plot and statistics.",
+    )
+
+    alert_threshold = st.sidebar.slider(
+        "Alert threshold (gCO₂/kWh)",
+        min_value=50, max_value=500,
+        value=250, step=10,
+        help="Warn when live intensity is above this value.",
+    )
+
+    auto_refresh = st.sidebar.checkbox(
+        "Auto-refresh every 5 min", value=False,
+        help="Streamlit re-runs periodically to pull the latest slot.",
+    )
+
+    if st.sidebar.button("🔄 Refresh now"):
+        st.cache_data.clear()
+        st.rerun()
+
+    st.sidebar.markdown("---")
+    st.sidebar.caption(
+        "Data: [Carbon Intensity API](https://carbonintensity.org.uk/) · "
+        "National Grid ESO."
+    )
+
+    return dict(
+        postcode=postcode,
+        history_days=history_days,
+        alert_threshold=alert_threshold,
+        auto_refresh=auto_refresh,
+    )
+
+
+def render_header_metrics(latest: pd.Series, threshold: float) -> None:
+    """Top-of-page three-column metric strip + alert banner."""
+    forecast = float(latest["forecast"])
+    index = str(latest["index"]).title()
+    ts = latest["from"].tz_convert(UK_TZ)
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Current intensity", f"{forecast:.0f} gCO₂/kWh", index)
+    col2.metric("Slot (UK)", ts.strftime("%a %d %b, %H:%M"))
+    col3.metric("Category", categorize_intensity(forecast))
+
+    color = COLOR_MAP.get(index.lower(), "#7f8c8d")
+    st.markdown(
+        f"""
+        <div style='padding: 12px 16px; border-left: 6px solid {color};
+                    background: rgba(127,140,141,0.08); border-radius: 4px;
+                    margin: 0.5rem 0 1rem 0;'>
+            <b>Status:</b>
+            <span style='color:{color}; font-weight:600;'>{index}</span>
+            — approximately <b>{forecast:.0f} gCO₂/kWh</b>.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if forecast >= threshold:
+        st.warning(
+            f"⚠️ Live intensity **{forecast:.0f} gCO₂/kWh** is above your "
+            f"alert threshold of {threshold:.0f}. Consider deferring heavy usage."
+        )
+    else:
+        st.success(
+            f"✅ Live intensity **{forecast:.0f} gCO₂/kWh** is below your "
+            f"alert threshold of {threshold:.0f} — a good time to run appliances."
+        )
+
+
+def render_best_times(forecast_df: pd.DataFrame, history_df: pd.DataFrame) -> None:
+    """Show greenest upcoming slots, falling back to yesterday if needed."""
+    st.subheader("⚡ Greenest upcoming windows")
+
+    if not forecast_df.empty:
+        best = best_slots(forecast_df, n=6)
+        subtitle = "Based on the live 48‑hour forecast."
+    else:
+        # Fallback: yesterday's data from the local cache.
+        df = history_df.copy()
+        df["local_time"] = df["from"].dt.tz_convert(UK_TZ)
+        yesterday = (datetime.now(UK_TZ) - timedelta(days=1)).date()
+        df = df[df["local_time"].dt.date == yesterday]
+        best = best_slots(df, n=6)
+        subtitle = "Forecast unavailable — showing yesterday's greenest slots as a proxy."
+
+    if best.empty:
+        st.info("No forecast or recent data available to recommend windows.")
+        return
+
+    st.caption(subtitle)
+    display = best.assign(
+        When=best["local_time"].dt.strftime("%a %d %b · %H:%M"),
+        End=(best["local_time"] + pd.Timedelta(minutes=30)).dt.strftime("%H:%M"),
+        Intensity=best["forecast"].round(0).astype(int).astype(str) + " gCO₂/kWh",
+        Category=best["forecast"].apply(categorize_intensity),
+    )[["When", "End", "Intensity", "Category"]]
+
+    st.dataframe(display, hide_index=True, use_container_width=True)
+    st.caption(
+        "💡 Shift dishwashers, EV charging or laundry into these windows "
+        "to cut your electricity emissions."
+    )
+
+
+def render_live_forecast_tab(
+    latest: pd.Series,
+    forecast_df: pd.DataFrame,
+    history_df: pd.DataFrame,
+    threshold: float,
+) -> None:
+    render_header_metrics(latest, threshold)
+
+    if not forecast_df.empty:
+        st.plotly_chart(
+            intensity_line_chart(forecast_df, "48‑hour forward forecast"),
+            use_container_width=True,
+        )
+    else:
+        st.info("Forward forecast is currently unavailable from the API.")
+
+    render_best_times(forecast_df, history_df)
+
+
+def render_historical_tab(history_df: pd.DataFrame, days: int) -> None:
+    cutoff = datetime.now(pytz.UTC) - timedelta(days=days)
+    recent = history_df[history_df["from"] >= cutoff]
+
+    if recent.empty:
+        st.info("No historical data in the selected window.")
+        return
+
+    st.plotly_chart(
+        intensity_line_chart(recent, f"Last {days} days · half‑hourly"),
+        use_container_width=True,
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.plotly_chart(heatmap_chart(recent), use_container_width=True)
+    with col2:
+        st.plotly_chart(daily_boxplot(recent), use_container_width=True)
+
+
+def render_generation_tab(history_df: pd.DataFrame, days: int) -> None:
+    cutoff = datetime.now(pytz.UTC) - timedelta(days=days)
+    recent = history_df[history_df["from"] >= cutoff]
+    fig = generation_mix_chart(recent)
+
+    if fig is None:
+        st.info("Generation-mix data is not present in the cached dataset.")
+        return
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    fuels = fuel_columns(recent)
+    if fuels:
+        # Summary table: mean share per fuel across the window.
+        summary = (
+            recent[fuels].mean().round(1).sort_values(ascending=False)
+            .rename_axis("Fuel").reset_index(name="Mean share (%)")
+        )
+        st.subheader("Mean share by fuel")
+        st.dataframe(summary, hide_index=True, use_container_width=True)
+
+
+def render_data_explorer_tab(history_df: pd.DataFrame) -> None:
+    st.subheader("📅 Filter history")
+
+    min_ts = history_df["from"].min().to_pydatetime()
+    max_ts = history_df["from"].max().to_pydatetime()
+
+    if min_ts == max_ts:
+        st.info("Not enough data yet to show a range slider.")
+        return
+
+    start, end = st.slider(
+        "Select a date range",
+        min_value=min_ts, max_value=max_ts,
+        value=(max_ts - timedelta(days=7), max_ts),
+        format="YYYY-MM-DD HH:mm",
+    )
+
+    mask = (history_df["from"] >= pd.Timestamp(start, tz="UTC")) & (
+        history_df["from"] <= pd.Timestamp(end, tz="UTC")
+    )
+    subset = history_df.loc[mask].sort_values("from", ascending=False)
+
+    st.caption(f"{len(subset):,} half‑hour slots in the selection.")
+    st.dataframe(subset, use_container_width=True, height=320)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("📈 Summary statistics")
+        numeric = subset.select_dtypes("number")
+        st.dataframe(numeric.describe().round(2), use_container_width=True)
+    with c2:
+        st.subheader("⬇️ Export")
+        st.download_button(
+            "Download CSV",
+            subset.to_csv(index=False).encode("utf-8"),
+            file_name=f"carbon_intensity_{start:%Y%m%d}_{end:%Y%m%d}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+
+# ===========================================================================
+# Main app
+# ===========================================================================
+
+def main() -> None:
+    settings = sidebar_controls()
+
+    # Auto-refresh via a lightweight meta tag. Simpler and dep-free compared
+    # to a background thread or streamlit-autorefresh.
+    if settings["auto_refresh"]:
+        st.markdown(
+            '<meta http-equiv="refresh" content="300">', unsafe_allow_html=True
+        )
+
+    st.title("🌍 UK Carbon Intensity Dashboard")
+    st.caption(
+        f"Region: **{settings['postcode']}**  ·  "
+        f"History window: **{settings['history_days']} days**  ·  "
+        f"Alert threshold: **{settings['alert_threshold']} gCO₂/kWh**"
+    )
+
+    # Pull data (incrementally) and the live forward forecast.
+    with st.spinner("Updating local dataset…"):
+        history_df = refresh_local_data(settings["postcode"])
+
+    if history_df.empty:
+        st.error(
+            "No carbon-intensity data is available yet. Check your network "
+            "connection and the postcode, then press 🔄 Refresh now."
+        )
+        return
+
+    forecast_df = get_forward_forecast(settings["postcode"])
+
+    latest = (
+        forecast_df.iloc[0] if not forecast_df.empty
+        else history_df.sort_values("from").iloc[-1]
+    )
+
+    tab_live, tab_hist, tab_gen, tab_data = st.tabs(
+        ["Live & Forecast", "Historical Trends", "Generation Mix", "Data Explorer"]
+    )
+
+    with tab_live:
+        render_live_forecast_tab(
+            latest, forecast_df, history_df, settings["alert_threshold"]
+        )
+    with tab_hist:
+        render_historical_tab(history_df, settings["history_days"])
+    with tab_gen:
+        render_generation_tab(history_df, settings["history_days"])
+    with tab_data:
+        render_data_explorer_tab(history_df)
+
+
+if __name__ == "__main__":
+    main()
